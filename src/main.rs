@@ -10,4 +10,6 @@ fn main() {
     // Give the server to the client
     let client = PTPClient::new(server);
     assert!(client.is_ok());
+
+
 }

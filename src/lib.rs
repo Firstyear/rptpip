@@ -1,22 +1,49 @@
 
 #[macro_use]
 extern crate nom;
+extern crate byteorder;
+
+use byteorder::{ByteOrder, LittleEndian};
 
 use std::mem;
 use std::io::{self, Read, Write};
 
+enum PTPServerState {
+    Initial,
+    HandshakeSize,
+    HandshakeType,
+    HandshakeData,
+    Connected,
+    Size,
+    Type,
+    Data,
+    Disconnected,
+}
+
 pub struct PTPServer {
+    state: PTPServerState,
 }
 
 impl PTPServer {
     pub fn new() -> Self {
-        PTPServer{}
+        PTPServer{
+            state: PTPServerState::Initial,
+        }
     }
 }
 
 impl Write for PTPServer {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         // Check what the request was, then store the state.
+        self.state = match self.state {
+            PTPServerState::Initial => {
+                PTPServerState::HandshakeSize
+            }
+            _ => {
+                PTPServerState::Disconnected
+            }
+        };
+
         Ok(0)
     }
 
@@ -27,16 +54,74 @@ impl Write for PTPServer {
 
 impl Read for PTPServer {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut rlen: io::Result<usize> = Ok(0);
+        self.state = match self.state {
+            PTPServerState::HandshakeSize => {
+                println!("Sending Handshake Size");
+                let response: [u8; 4] = [0x0c, 00, 00, 00];
+                let len = response.len();
+                buf[..len].clone_from_slice(&response);
+                rlen = Ok(len);
+                PTPServerState::HandshakeType
+            }
+            PTPServerState::HandshakeType => {
+                println!("Sending Handshake Type");
+                let response: [u8; 4] = [0x05, 00, 00, 00];
+                let len = response.len();
+                buf[..len].clone_from_slice(&response);
+                rlen = Ok(len);
+                PTPServerState::HandshakeData
+            }
+            PTPServerState::HandshakeData => {
+                println!("Sending Handshake Data");
+                let response: [u8; 4] = [0x20, 0x1e, 00, 00];
+                let len = response.len();
+                buf[..len].clone_from_slice(&response);
+                rlen = Ok(len);
+                PTPServerState::Connected
+            }
+            _ => {
+                PTPServerState::Disconnected
+            }
+        };
         // Based on the state return an appropriate response.
-        let response: [u8; 12] = [00, 00, 00, 0x0c, 00, 00, 00, 0x05, 00, 00, 0x20, 0x1e];
-        let len = response.len();
-        buf[..len].clone_from_slice(&response);
-        Ok(len)
+        rlen
     }
 }
 
+#[derive(Debug)]
+pub enum PTPError {
+    UnknownError,
+    ResponseShort,
+    InvalidResponseSize,
+    InvalidResponseState,
+    HandshakeError,
+}
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+#[repr(u32)]
+pub enum PTPResponseCode {
+    Unknown = 0x0,
+    Success = 0x00002019,
+    DeviceBusy = 0x0000201e,
+}
+
+impl PTPResponseCode {
+    fn new(code: u32) -> Self {
+        match code {
+            0x00002019 => PTPResponseCode::Success,
+            0x0000201e => PTPResponseCode::DeviceBusy,
+            _ => PTPResponseCode::Unknown,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub enum PTPResult {
-    UnknownError
+    Unknown {},
+    UintResult4 {
+        result: PTPResponseCode,
+    },
 }
 
 // Need a proto
@@ -118,7 +203,6 @@ impl PTPHandshake {
     }
 }
 
-
 pub struct PTPClient<T: Read + Write> {
     transport: T
 }
@@ -126,7 +210,7 @@ pub struct PTPClient<T: Read + Write> {
 impl <T> PTPClient<T>
     where T: Read + Write
 {
-    pub fn new(transport: T) -> Result<Self, PTPResult> {
+    pub fn new(transport: T) -> Result<Self, PTPError> {
         let mut inner = PTPClient {
             transport: transport
         };
@@ -142,28 +226,80 @@ impl <T> PTPClient<T>
         }
     }
 
-    fn handshake(&mut self) -> Result<(), PTPResult> {
+    fn recieve_response(&mut self) -> Result<PTPResult, PTPError> {
+
+        let mut raw_size = [0u8; 4];
+        let mut raw_type = [0u8; 4];
+
+        self.transport.read(&mut raw_size);
+        self.transport.read(&mut raw_type);
+
+        let rsize: u32 = LittleEndian::read_u32(&raw_size);
+        let rtype: u32 = LittleEndian::read_u32(&raw_type);
+
+        // Read the first 8 bytes to get the length and struct type.
+
+
+        // Now that we know the remaining length, read in the rest - 8.
+        if rsize <= 8 {
+            return Err(PTPError::ResponseShort);
+        }
+
+        let rem_data_size: usize = (rsize - 8) as usize;
+        println!("rsize {}, rtype {}, data {} bytes", rsize, rtype, rem_data_size);
+        let mut data: Vec<u8> = vec![0; rem_data_size];
+        self.transport.read(data.as_mut_slice());
+
+        // println!("raw_data: {:?}", data);
+
+        match rtype {
+            0x05 => {
+                if rem_data_size != 4 {
+                    Err(PTPError::InvalidResponseSize)
+                }else {
+                    let response_code = LittleEndian::read_u32(data.as_slice());
+                    println!("responsecode {}", response_code);
+
+                    Ok(PTPResult::UintResult4 {
+                        // Could convert this later?
+                        result: PTPResponseCode::new(response_code)
+                    })
+                }
+            }
+            _ => {
+                Err(PTPError::UnknownError)
+            }
+        }
+    }
+
+    fn handshake(&mut self) -> Result<PTPResult, PTPError> {
         let hs = PTPHandshake::new("Rust PTP/IP");
         let req = hs.to_u8();
 
         println!("Sending request");
-
-
         // Send it to the transport:
         self.transport.write(req.as_slice());
         self.transport.flush();
-        let mut response = [0u8; 128];
-        self.transport.read(&mut response);
+        // Decode our response and send it back,
+        let response = self.recieve_response();
 
-        // Now decode the response to something?
+        println!("{:?}", response);
 
-        // Read the first bytes to get the length.
+        match response {
+            Ok(PTPResult::UintResult4 { result }) => {
+                // Ok
+                if result != PTPResponseCode::Success {
+                    return Err(PTPError::HandshakeError);
+                }
+            }
+            _ => return Err(PTPError::InvalidResponseState),
+        };
 
-        for i in 0..4 {
-            println!("{}", response[i]);
-        }
+        response
+    }
 
-        Ok(())
+    fn disconnect(&mut self) {
+        // Send the disconnect - 0x00 00 00 00, 0xff ff ff ff
     }
 }
 
